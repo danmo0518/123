@@ -1,0 +1,253 @@
+title: "藻類生長阻害試験データ解析結果シート統計リポート"
+params:    # ルーティーンの解析時は以下の4項目のみ変更すれば良い
+  p_chemicalname: Example    #試験物質名
+  p_datafilename: AlgaeData_sample.xlsx   # 読み込みたいExcelファイル
+  p_sheetname: AlgaeCellData    #上記Excelファイルの中でRに読み込ませたいタブ
+  p_unit: mg/L
+output:
+  word_document: default
+  html_document: default
+---
+
+この解析シートProgCode_AlgaeS16.Rmdのバージョンはv20221209である。解析の実行日時は以下：
+```{r time}
+Sys.time()
+```
+
+```{r include_packages, include=FALSE, chache=FALSE}
+# パッケージそのものがない場合は事前にインストールが必要
+require(knitr)
+require(multcomp)
+require(drc)
+require(rmarkdown)
+require(readxl)
+```
+
+## 1. 試験データの入力と確認
+```{r data_input}
+print(params$p_datafilename)
+print(params$p_sheetname)
+data.tbl <- read_excel(params$p_datafilename, params$p_sheetname)
+
+DATAID <- data.tbl$DATAID
+CONC <- data.tbl$CONC
+H0 <- data.tbl$H0
+H24 <- data.tbl$H24
+H48 <- data.tbl$H48
+H72 <- data.tbl$H72
+CONC.fv <- as.factor(data.tbl$CONC)
+NUMLEV <- length(levels(CONC.fv))
+
+# 入力値の確認
+kable(data.frame(DATAID, CONC, H0, H24, H48, H72))
+```
+
+## 2. 基礎統計量の算出
+
+## 2.1 細胞濃度の統計量
+```{r basic_stats_cell, fig.width=9, fig.height=3}
+# 平均と分散の計算
+H0.MEAN <- tapply(H0, CONC, mean)
+H0.SD <- tapply(H0, CONC, sd)
+H24.MEAN <- tapply(H24, CONC, mean)
+H24.SD <- tapply(H24, CONC, sd)
+H48.MEAN <- tapply(H48, CONC, mean)
+H48.SD <- tapply(H48, CONC, sd)
+H72.MEAN <- tapply(H72, CONC, mean)
+H72.SD <- tapply(H72, CONC, sd)
+
+kable(cbind(H0.MEAN, H0.SD, H24.MEAN, H24.SD, H48.MEAN, H48.SD, H72.MEAN, H72.SD))
+
+# 散布図
+par(mfrow =c(1,3))
+plot(H24 ~ CONC, ylim = c(0, 1.1*max(H24)), ylab="Cell density (cells/ml)", main="24h", xlab="Concentration", col=2, cex=1.5)
+plot(H48 ~ CONC, ylim = c(0, 1.1*max(H48)), ylab="Cell density (cells/ml)", main="48h", xlab="Concentration", col=2, cex=1.5)
+plot(H72 ~ CONC, ylim = c(0, 1.1*max(H72)), ylab="Cell density (cells/ml)", main="72h", xlab="Concentration", col=2, cex=1.5)
+```
+
+## 2.2　生長速度の計算と統計量
+```{r basic_stats_growth, fig.width=9, fig.height=6}
+# 細胞濃度から生長速度を計算する
+gr0to24.v <- log(H24 / H0)
+gr24to48.v <- log(H48 / H24)
+gr48to72.v <- log(H72 / H48)
+gr0to72.v <- log(H72 / H0)/(3)
+gr24to72.v <- log(H72 / H24)/(2)
+
+# 計算結果をdataframeの形にまとめる
+toxGRdata.df <- data.frame(DATAID, CONC.v = CONC, GR0to72.v = gr0to72.v, GR0to24.v = gr0to24.v, GR24to48.v = gr24to48.v, GR48to72.v = gr48to72.v, GR24to72.v = gr24to72.v)
+kable(toxGRdata.df)
+
+# 平均と分散の計算
+gr0to72.MEAN <- tapply(gr0to72.v, CONC, mean)
+gr0to72.SD <- tapply(gr0to72.v, CONC, sd)
+kable(cbind(gr0to72.MEAN, gr0to72.SD))
+
+# 散布図
+par(mfrow =c(2,3))
+plot(gr0to72.v ~ CONC, ylim = c(0, 1.1*max(gr0to72.v)), ylab="Growth Rate (/d)", main="0-72h", xlab="Concentration", col=2, cex=1.5)
+plot(gr0to24.v ~ CONC, ylim = c(0, 1.1*max(gr0to24.v)), ylab="Growth Rate (/d)", main="0-24h", xlab="Concentration", col=2, cex=1.5)
+plot(gr24to48.v ~ CONC, ylim = c(0, 1.1*max(gr24to48.v)), ylab="Growth Rate (/d)", main="24-48h", xlab="Concentration", col=2, cex=1.5)
+plot(gr48to72.v ~ CONC, ylim = c(0, 1.1*max(gr48to72.v)), ylab="Growth Rate (/d)", main="48-72h", xlab="Concentration", col=2, cex=1.5)
+plot(gr24to72.v ~ CONC, ylim = c(0, 1.1*max(gr24to72.v)), ylab="Growth Rate (/d)", main="24-72h", xlab="Concentration", col=2, cex=1.5)
+```
+
+## 3. データ解析：ICxの算出
+データ解析は[drcパッケージ](http://cran.r-project.org/web/packages/drc/index.html)を用いた対数ロジスティック回帰により行う。
+
+### 3.1 ICxとその信頼区間の算出
+ICxとその95%信頼区間を算出する。2パラメータlog-logistic modelにより濃度反応曲線を算出する。上限値には対照区の平均値を固定値として入れる方針とした。
+```{r applyingLL2, fig.width=4, fig.height=4, message=FALSE}
+# 対照区の生長速度の平均の計算
+contdata.df <- subset(toxGRdata.df, CONC.v == 0)
+# 2パラメータモデル用のデータ形式への変換
+CONT.GR <- mean(contdata.df$GR0to72.v)
+#notcontdata.df <- subset(toxGRdata.df, CONC.v > 0)
+
+# 濃度反応曲線の当てはめ：2パラメータ対数ロジスティックモデル
+drmLL2.result <- drm(GR0to72.v ~ CONC.v, data = toxGRdata.df, fct = LL.2(upper=CONT.GR), type = "continuous")
+summary(drmLL2.result)
+plot(drmLL2.result, type="all", ylab="Growth Rate (/d)", main="", xlab=paste("Concentration (",params$p_unit,")",sep=""))
+
+# ICxの計算：2パラメータ対数ロジスティックモデル
+ICx_to_compute <- c(5,10,20,25,50)
+ECx.drmLL2.res <- ED(drmLL2.result, ICx_to_compute, interval="delta")
+rownames(ECx.drmLL2.res) <- paste("IC",as.character(ICx_to_compute))
+kable(ECx.drmLL2.res)
+```
+
+## 4. データ解析：NOECの算出
+NOECの算出は、濃度区間での等分散性が仮定できる場合にはDunnettの検定を用い、仮定できない場合にはSteelの検定を用いる。本解析シートでは、等分散性が仮定できるかどうかは、Bartlettの等分散性検定に基づき判断する。
+
+### 4.1 等分散性の検定
+等分散性の検定を行う。濃度区間で分散が有意に異なる（p < 0.05）場合には「等分散性が仮定できない」と判断する。
+```{r bartlett_test}
+# Bartlettの検定を実行
+YSIG <- c("SIGNIFICANT")
+NSIG <- c("NOT SIGNIFICANT")
+bartlett.res <- bartlett.test(gr0to72.v ~ CONC.fv)
+bartlett.res
+ifelse(as.numeric(bartlett.res$p.value) < 0.05, YSIG, NSIG)
+```
+上記の"p-value"がp値であり、値が< 0.05の場合には「等分散性が仮定できない」と判断する。
+
+### 4.2 Dunnet法による多重比較検定
+Bartlettの等分散検定の結果、p > 0.05となった場合には、等分散性を仮定してDunnet法による多重比較検定を採用する。
+```{r Dunnet_test, message=FALSE}
+# 分散分析の実行
+aov.result <- aov(gr0to72.v ~ CONC.fv)
+# ダネット法による多重比較の実行
+Dunnett.result <- glht(aov.result, linfct = mcp(CONC.fv = "Dunnett"), alternative = "less")
+# 多重比較の結果の表示
+summary(Dunnett.result)
+```
+上の表の左端の値は、比較している濃度区を表す。＊がp=0.05で有意、＊＊がp=0.01で有意、＊＊＊がp=0.001で有意を表す。
+
+### 4.3 Steelの検定
+Bartlettの等分散検定の結果、等分散性が棄却された（p < 0.05の）場合には、Steel法によるノンパラメトリックな多重比較検定を採用する。以下の計算では群馬大の青木繁伸先生のサイトからSteelの検定の関数を読み込んで利用しているため、インターネットへの接続が必須である。
+```{r Steel}
+# 群馬大の青木先生のサイトからSteelの検定の関数を読み込む
+source("http://aoki2.si.gunma-u.ac.jp/R/src/Steel.R", encoding="euc-jp")
+#source("http://aoki2.si.gunma-u.ac.jp/R/src/Steel.R")
+
+# グループに1から順に数値をつける（青木先生のスクリプトに適合した形式への変換）
+group <-factor(CONC.fv,labels=c(1:NUMLEV))
+# steelの多重比較検定の実行
+steel.result <- Steel(gr0to72.v, group)
+
+#--- 比較すべきt値の計算（有意水準上側5%点）---#
+# 濃度区の数をaに格納
+a <- NUMLEV
+# steel.resultからrhoの値を取得（steel.resultのa+1以降にrhoの値が格納されている）
+# rhoの値は実験デザイン（対照区と各曝露区のn）から決まるのでsteel.resultのみから決めてよい
+rho <- steel.result[a+1]
+
+# ダネットの表の値を格納；永田・吉田(1997)のp160-173の表を基にした
+roh01 <- c(0, 1.645, 1.951, 2.116, 2.228, 2.312, 2.378, 2.434, 2.481)
+roh03 <- c(0, 1.645, 1.938, 2.097, 2.204, 2.285, 2.349, 2.402, 2.447)
+roh05 <- c(0, 1.645, 1.916, 2.602, 2.160, 2.234, 2.292, 2.340, 2.381)
+roh07 <- c(0, 1.645, 1.877, 2.001, 2.083, 2.144, 2.193, 2.233, 2.267)
+roh09 <- c(0, 1.645, 1.798, 1.887, 1.929, 1.967, 1.998, 2.022, 2.043)
+# rhoの値の内挿計算のための関数を定義；永田・吉田(1997)のp72の式5.27を基にした
+get_ref_tvalue.fn <- function(rho1, rho2, rho_test, t_rho1, t_rho2){
+  Numerator1st <- (1/(1-rho2)) - (1/(1-rho_test))
+  Denominator1st <- (1/(1-rho2)) - (1/(1-rho1))
+  Numerator2nd <- (1/(1-rho_test)) - (1/(1-rho1))
+  Denominator2nd <- (1/(1-rho2)) - (1/(1-rho1))
+  t_val <- ((Numerator1st/Denominator1st)*t_rho1) + ((Numerator2nd/Denominator2nd)*t_rho2)
+  return(t_val)
+}
+# rhoの値の内挿の計算
+if(rho < 0.1) {"t value cannot be calculated!"
+}else if(rho < 0.3) { reference_t_value <- get_ref_tvalue.fn(0.1, 0.3, rho, roh01[a],roh05[a])
+}else if(rho < 0.5) { reference_t_value <- get_ref_tvalue.fn(0.3, 0.5, rho, roh03[a],roh05[a])
+}else if(rho < 0.7) { reference_t_value <- get_ref_tvalue.fn(0.5, 0.7, rho, roh05[a],roh07[a])
+}else if(rho < 0.9) { reference_t_value <- get_ref_tvalue.fn(0.7, 0.9, rho, roh07[a],roh09[a])
+}else{"t value cannot be calculated!"}
+
+#--- p < 0.05となるtの参照値の表示と有意差の計算
+data.frame(reference_t_value)
+
+t.tmp <- as.vector(t(steel.result[1:(NUMLEV-1)]))
+SIG.tmp <- rep("No",(NUMLEV-1))
+for(i in 1:(NUMLEV-1)){
+  if (is.nan(t.tmp[i])){}
+   else if(t.tmp[i] > reference_t_value){SIG.tmp[i] <- "Yes"}
+}
+kable(data.frame(Conc = levels(CONC.fv)[2:NUMLEV], t_value = t.tmp, Significance_005 = SIG.tmp))
+```
+
+
+## A補遺: オプション計算
+以下の計算はオプションで行われる。必要に応じて削除しても構わない。
+
+#### A1:3パラメータ対数ロジスティックモデルによる解析結果：ICxの計算
+```{r applyingLL3, fig.width=4, fig.height=4, message=FALSE}
+# 濃度反応曲線の当てはめ：3パラメータ対数ロジスティックモデル
+drmLL3.result <- drm(GR0to72.v ~ CONC.v, data = toxGRdata.df, fct = LL.3(), type = "continuous")
+summary(drmLL3.result)
+plot(drmLL3.result,type="all", xlab=paste("Concentration (",params$p_unit,")",sep=""), ylab="Growth Rate (/d)",ylim=c(0,max(toxGRdata.df$GR0to72.v)))
+
+# ICxの計算：3パラメータ対数ロジスティックモデル
+ICx.drmLL3.result <- ED(drmLL3.result, ICx_to_compute, interval="delta")
+rownames(ICx.drmLL3.result) <- paste("IC",as.character(ICx_to_compute))
+kable(ICx.drmLL3.result)
+```
+
+
+#### A2: y軸方向の信頼区間を介した計算法によるECx (p_ECx_via_Yaxis <- 1に設定時のみ)
+以下の計算法ではy軸方向の95%信頼区間をWald法で計算した後に、X軸方向のECxの信頼区間を数値探索することで信頼区間を算出している。この計算法ではECxの値は負の値をとらないが、この計算法もあくまで近似である。（メモ：20180608現在、最新のバージョンのRでこの計算を行うとwarningが大量に出るので、本来あまり望ましくないがwarning=FALSEと設定している）
+```{r Appendix1_1, fig.width=4, fig.height=4, warning=FALSE}
+#--- 以下PredX, GetECx, GetECxAllは信頼区間の計算用関数
+# PredXはGetECxとpredict関数を仲介する
+PredX <- function(x,PdX.drm,bound){
+  return(predict(PdX.drm,newdata=as.data.frame(x),interval='confidence')[bound])
+}
+# GetECXはpredict関数で計算したy軸方向の信頼区間の数値列からx軸方向のECxを探索する
+GetECx <- function(ECx,GEx.drm,maxc,contfert){
+  Estim <- uniroot(function(x) (PredX(x,GEx.drm,1)/contfert) - (1-0.01*ECx),
+                   lower = 0, upper = 10*maxc, tol = 0.0001)$root
+  Lower <- uniroot(function(x) (PredX(x,GEx.drm,2)/contfert) - (1-0.01*ECx),
+                   lower = 0, upper = 10*maxc, tol = 0.0001)$root
+  Upper <- uniroot(function(x) (PredX(x,GEx.drm,3)/contfert) - (1-0.01*ECx),
+                   lower = 0, upper = 10*maxc, tol = 0.0001)$root
+  ret.all <- cbind(ECx,Estim,Lower,Upper)
+  return(ret.all)
+}
+# GetECxAllは複数のxについての計算をまとめる
+GetECxAll <- function(GEA.drm,maxc,contfert){
+  GEA.tmp1 <- rbind(GetECx(5,GEA.drm,maxc,contfert),GetECx(10,GEA.drm,maxc,contfert))
+  GEA.tmp2 <- rbind(GetECx(20,GEA.drm,maxc,contfert),GetECx(25,GEA.drm,maxc,contfert))
+  GEA.tmp3 <- rbind(GEA.tmp1,GEA.tmp2)
+  return(rbind(GEA.tmp3,GetECx(50,GEA.drm,maxc,contfert)))
+}
+
+kable(print(GetECxAll(drmLL2.result,max(CONC),CONT.GR)))
+
+```
+
+#### 4.3 解析ログ
+本解析を実行（rmdファイルからhtmlへの変換）をした際の作業環境を記録します
+```{r}
+#解析に用いたRとその関数のバージョンの表示
+sessionInfo()
